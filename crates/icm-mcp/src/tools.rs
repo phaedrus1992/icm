@@ -1247,6 +1247,27 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     output
 }
 
+/// Project filter from the `project` arg: an empty string disables it, and
+/// an absent arg falls back to the server's cwd project.
+fn recall_project(args: &Value) -> Option<String> {
+    match get_str(args, "project") {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => std::env::current_dir()
+            .ok()
+            .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy())),
+    }
+}
+
+/// Recall's project scope rule: preference memories are always in scope;
+/// otherwise the topic must match the project (segment-aware).
+fn in_project_scope(m: &Memory, project: Option<&str>) -> bool {
+    match project {
+        None => true,
+        Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
+    }
+}
+
 fn tool_recall(
     store: &Store,
     embedder: Option<&dyn Embedder>,
@@ -1275,21 +1296,8 @@ fn tool_recall(
     // derive it from the server's cwd via the shared icm-core detection
     // (git remote first) — the CLI hooks store under that name, so a raw
     // cwd basename would silently miss on renamed checkouts (audit finding).
-    let project_arg = get_str(args, "project");
-    let cwd_project = std::env::current_dir()
-        .ok()
-        .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy()));
-    let project: Option<String> = match project_arg {
-        Some("") => None,
-        Some(p) => Some(p.to_string()),
-        None => cwd_project,
-    };
-    let project_filter = |m: &Memory| -> bool {
-        match project.as_deref() {
-            None => true,
-            Some(p) => is_preference_topic(&m.topic) || project_matches(&m.topic, Some(p)),
-        }
-    };
+    let project = recall_project(args);
+    let project_filter = |m: &Memory| -> bool { in_project_scope(m, project.as_deref()) };
 
     // Audit finding: filters were applied AFTER the store already truncated
     // to `limit` — if the top-`limit` global hits all belonged to other
