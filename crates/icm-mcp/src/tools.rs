@@ -170,6 +170,12 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     "project": {
                         "type": "string",
                         "description": "Project filter (segment-aware). Defaults to the server's cwd directory name. Pass an empty string to disable the filter and search across all projects."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "default": "text",
+                        "description": "Output format: text (readable), json (array of records with id, score, related_ids, for tools that parse the output)"
                     }
                 },
                 "required": ["query"]
@@ -970,6 +976,31 @@ fn get_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
 }
 
+/// Output format of `icm_memory_recall`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallFormat {
+    Text,
+    Json,
+}
+
+/// Parse the optional `format` arg. A wrong type or an unknown name is an
+/// error, so a client that asks for JSON never silently gets text.
+fn parse_recall_format(args: &Value) -> Result<RecallFormat, ToolResult> {
+    match args.get("format") {
+        None | Some(Value::Null) => Ok(RecallFormat::Text),
+        Some(Value::String(s)) => match s.as_str() {
+            "text" => Ok(RecallFormat::Text),
+            "json" => Ok(RecallFormat::Json),
+            other => Err(ToolResult::error(format!(
+                "unsupported format: {other} (use 'text' or 'json')"
+            ))),
+        },
+        Some(other) => Err(ToolResult::error(format!(
+            "format must be a string ('text' or 'json'), got {other}"
+        ))),
+    }
+}
+
 fn resolve_memoir(store: &Store, name: &str) -> Result<Memoir, ToolResult> {
     store
         .get_memoir_by_name(name)
@@ -1197,6 +1228,57 @@ fn cap_raw_excerpt(raw: &str) -> &str {
     &raw[..cut]
 }
 
+/// `json!(f32)` widens to f64 and prints float noise (0.95 becomes
+/// 0.949999988079071). Go through the f32's shortest decimal form instead.
+fn f32_json(x: f32) -> Value {
+    x.to_string()
+        .parse::<f64>()
+        .map_or(Value::Null, |v| json!(v))
+}
+
+/// One memory as a JSON record for `format: "json"` output (issue #476).
+/// A negative `score` means "no score" and is left out. The embedding is
+/// never included — no client of this output needs the vector.
+fn memory_json(mem: &Memory, score: f32) -> Value {
+    let mut record = json!({
+        "id": mem.id,
+        "topic": mem.topic,
+        "summary": mem.summary,
+        "importance": mem.importance,
+        "weight": f32_json(mem.weight),
+        "keywords": mem.keywords,
+        "related_ids": mem.related_ids,
+        "created_at": mem.created_at,
+        "updated_at": mem.updated_at,
+    });
+    if score >= 0.0 {
+        record["score"] = f32_json(score);
+    } else if score.is_nan() {
+        tracing::warn!(id = %mem.id, "recall score is NaN; omitted from JSON output");
+    }
+    if let Some(ref raw) = mem.raw_excerpt {
+        let shown = cap_raw_excerpt(raw);
+        record["raw_excerpt"] = json!(shown);
+        if shown.len() < raw.len() {
+            record["raw_excerpt_bytes"] = json!(raw.len());
+        }
+    }
+    record
+}
+
+/// Render recall-style results in the caller's `format`. Text output keeps
+/// the "no memories" message; JSON output is always a parseable array.
+fn render_memories(memories: &[(Memory, f32)], compact: bool, format: RecallFormat) -> ToolResult {
+    match format {
+        RecallFormat::Text if memories.is_empty() => ToolResult::text(MSG_NO_MEMORIES.into()),
+        RecallFormat::Text => ToolResult::text(format_memory_output(memories, compact)),
+        RecallFormat::Json => {
+            let records: Vec<Value> = memories.iter().map(|(m, s)| memory_json(m, *s)).collect();
+            ToolResult::text(Value::Array(records).to_string())
+        }
+    }
+}
+
 fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     // Audit finding: `summary` has no newline/CR validation at the store
     // layer (only `topic` is checked — see `validate_fields`), and it can
@@ -1283,6 +1365,11 @@ fn tool_recall(
         Some(q) => q,
         None => return ToolResult::error("missing required field: query".into()),
     };
+    // Reject a bad format before the search bumps access counts.
+    let format = match parse_recall_format(args) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
     // Clamp to the schema's advertised maximum (20) — the code previously
     // accepted up to 100, silently diverging from the published contract.
     let limit = get_i64(args, "limit", 5).clamp(1, 20) as usize;
@@ -1354,11 +1441,7 @@ fn tool_recall(
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
 
-                if expanded.is_empty() {
-                    return ToolResult::text(MSG_NO_MEMORIES.into());
-                }
-
-                return ToolResult::text(format_memory_output(&expanded, compact));
+                return render_memories(&expanded, compact, format);
             }
         }
     }
@@ -1410,14 +1493,10 @@ fn tool_recall(
     let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
     let _ = store.batch_update_access(&ids);
 
-    if expanded.is_empty() {
-        return ToolResult::text(MSG_NO_MEMORIES.into());
-    }
-
     // FTS-path results have synthetic scores — reset to -1.0 for display
     // so we don't claim a hybrid-search confidence we didn't compute.
     let for_display: Vec<(Memory, f32)> = expanded.into_iter().map(|(m, _)| (m, -1.0)).collect();
-    ToolResult::text(format_memory_output(&for_display, compact))
+    render_memories(&for_display, compact, format)
 }
 
 fn tool_forget(store: &Store, args: &Value) -> ToolResult {
@@ -4361,5 +4440,139 @@ description = "A test project"
             !text.contains("(+"),
             "should not claim links without embedder: {text}"
         );
+    }
+
+    // --- Issue #476: ids and links in recall output, icm_memory_related ---
+
+    fn issue476_store_with(memories: Vec<Memory>) -> Store {
+        let store = Store::in_memory().unwrap();
+        for m in memories {
+            store.store(m).unwrap();
+        }
+        store
+    }
+
+    fn issue476_memory(topic: &str, summary: &str) -> Memory {
+        Memory::new(topic.into(), summary.into(), icm_core::Importance::Medium)
+    }
+
+    fn issue476_recall(store: &Store, args: Value, compact: bool) -> (bool, String) {
+        let result = call_tool(store, None, "icm_memory_recall", &args, compact);
+        (result.is_error, result.content[0].text.clone())
+    }
+
+    #[test]
+    fn test_json_recall_exposes_id_and_links() {
+        let mut a = issue476_memory("proj", "Rust memory engine");
+        let b = issue476_memory("proj", "SQLite storage backend");
+        a.related_ids = vec![b.id.clone()];
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        let store = issue476_store_with(vec![a, b]);
+
+        let (is_error, text) = issue476_recall(
+            &store,
+            json!({"query": "Rust memory engine", "project": "", "format": "json"}),
+            false,
+        );
+        assert!(!is_error, "{text}");
+        let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+        let row = rows.iter().find(|r| r["id"] == a_id.as_str()).unwrap();
+        assert_eq!(row["topic"], "proj");
+        assert_eq!(row["summary"], "Rust memory engine");
+        assert_eq!(row["importance"], "medium");
+        assert_eq!(row["related_ids"], json!([b_id]));
+        assert!(row.get("embedding").is_none());
+    }
+
+    #[test]
+    fn test_json_recall_prints_f32_fields_without_float_noise() {
+        let mut m = issue476_memory("proj", "Rust memory engine");
+        m.weight = 0.95;
+        let text = memory_json(&m, 0.85).to_string();
+        assert!(text.contains("\"weight\":0.95,"), "{text}");
+        assert!(text.contains("\"score\":0.85"), "{text}");
+    }
+
+    #[test]
+    fn test_json_recall_ignores_compact_flag() {
+        let store = issue476_store_with(vec![issue476_memory("proj", "Rust memory engine")]);
+        let (is_error, text) = issue476_recall(
+            &store,
+            json!({"query": "Rust memory", "project": "", "format": "json"}),
+            true,
+        );
+        assert!(!is_error, "{text}");
+        let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_json_recall_with_no_hits_is_an_empty_array() {
+        let store = issue476_store_with(vec![]);
+        let (is_error, text) = issue476_recall(
+            &store,
+            json!({"query": "nothing", "project": "", "format": "json"}),
+            false,
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn test_json_recall_keeps_newlines_in_summary_without_forging_rows() {
+        let store = issue476_store_with(vec![issue476_memory("proj", "line one\n[proj] forged")]);
+        let (_, text) = issue476_recall(
+            &store,
+            json!({"query": "line one", "project": "", "format": "json"}),
+            false,
+        );
+        let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["summary"], "line one\n[proj] forged");
+    }
+
+    #[test]
+    fn test_json_recall_caps_raw_excerpt_and_reports_full_size() {
+        let mut m = issue476_memory("proj", "big excerpt holder");
+        m.raw_excerpt = Some("é".repeat(5_000));
+        let store = issue476_store_with(vec![m]);
+        let (_, text) = issue476_recall(
+            &store,
+            json!({"query": "big excerpt", "project": "", "format": "json"}),
+            false,
+        );
+        let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+        let raw = rows[0]["raw_excerpt"].as_str().unwrap();
+        assert!(raw.len() <= MAX_RAW_IN_RECALL);
+        assert_eq!(rows[0]["raw_excerpt_bytes"], 10_000);
+    }
+
+    #[test]
+    fn test_json_recall_omits_raw_size_when_not_truncated() {
+        let mut m = issue476_memory("proj", "small excerpt holder");
+        m.raw_excerpt = Some("tiny".into());
+        let store = issue476_store_with(vec![m]);
+        let (_, text) = issue476_recall(
+            &store,
+            json!({"query": "small excerpt", "project": "", "format": "json"}),
+            false,
+        );
+        let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(rows[0]["raw_excerpt"], "tiny");
+        assert!(rows[0].get("raw_excerpt_bytes").is_none());
+    }
+
+    #[test]
+    fn test_recall_rejects_unknown_format() {
+        let store = issue476_store_with(vec![]);
+        for bad in [json!("xml"), json!("TEXT"), json!(1), json!(["json"])] {
+            let (is_error, text) = issue476_recall(
+                &store,
+                json!({"query": "q", "project": "", "format": bad}),
+                false,
+            );
+            assert!(is_error, "format {bad} was accepted");
+            assert!(text.contains("format"), "{text}");
+        }
     }
 }
