@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde_json::{json, Value};
 
@@ -179,6 +181,44 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                     }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "icm_memory_related",
+            "description": "Fetch the memories linked to a memory id (its related_ids), following links up to `depth` hops. Use after icm_memory_recall to pull in connected context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory ID to start from"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "Number of link hops to follow"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Max number of results"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project filter (segment-aware). Defaults to the server's cwd directory name. Pass an empty string to disable the filter. A start id outside the project is an error; linked memories outside the project are skipped and not followed."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "json"],
+                        "default": "text",
+                        "description": "Output format: text (readable), json (array of records with id, hops, related_ids)"
+                    }
+                },
+                "required": ["id"]
             }
         }),
         json!({
@@ -791,6 +831,7 @@ pub fn call_tool_with_config(
         // Memory tools
         "icm_memory_store" => tool_store(store, embedder, args, compact, auto_consolidate),
         "icm_memory_recall" => tool_recall(store, embedder, args, compact),
+        "icm_memory_related" => tool_related(store, args, compact),
         "icm_memory_forget" => tool_forget(store, args),
         "icm_memory_forget_topic" => tool_forget_topic(store, args),
         "icm_memory_update" => tool_update(store, embedder, args),
@@ -976,7 +1017,18 @@ fn get_i64(args: &Value, key: &str, default: i64) -> i64 {
     args.get(key).and_then(|v| v.as_i64()).unwrap_or(default)
 }
 
-/// Output format of `icm_memory_recall`.
+/// Like [`get_i64`], but a present non-integer value is an error instead of
+/// a silent fallback to `default`.
+fn get_i64_strict(args: &Value, key: &str, default: i64) -> Result<i64, ToolResult> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| ToolResult::error(format!("{key} must be an integer, got {v}"))),
+    }
+}
+
+/// Output format of `icm_memory_recall` and `icm_memory_related`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecallFormat {
     Text,
@@ -1239,7 +1291,7 @@ fn f32_json(x: f32) -> Value {
 /// One memory as a JSON record for `format: "json"` output (issue #476).
 /// A negative `score` means "no score" and is left out. The embedding is
 /// never included — no client of this output needs the vector.
-fn memory_json(mem: &Memory, score: f32) -> Value {
+fn memory_json(mem: &Memory, score: f32, hops: Option<usize>) -> Value {
     let mut record = json!({
         "id": mem.id,
         "topic": mem.topic,
@@ -1256,6 +1308,9 @@ fn memory_json(mem: &Memory, score: f32) -> Value {
     } else if score.is_nan() {
         tracing::warn!(id = %mem.id, "recall score is NaN; omitted from JSON output");
     }
+    if let Some(hops) = hops {
+        record["hops"] = json!(hops);
+    }
     if let Some(ref raw) = mem.raw_excerpt {
         let shown = cap_raw_excerpt(raw);
         record["raw_excerpt"] = json!(shown);
@@ -1268,12 +1323,24 @@ fn memory_json(mem: &Memory, score: f32) -> Value {
 
 /// Render recall-style results in the caller's `format`. Text output keeps
 /// the "no memories" message; JSON output is always a parseable array.
-fn render_memories(memories: &[(Memory, f32)], compact: bool, format: RecallFormat) -> ToolResult {
+fn render_memories(
+    memories: &[(Memory, f32)],
+    hops: Option<&[usize]>,
+    compact: bool,
+    format: RecallFormat,
+) -> ToolResult {
     match format {
         RecallFormat::Text if memories.is_empty() => ToolResult::text(MSG_NO_MEMORIES.into()),
         RecallFormat::Text => ToolResult::text(format_memory_output(memories, compact)),
         RecallFormat::Json => {
-            let records: Vec<Value> = memories.iter().map(|(m, s)| memory_json(m, *s)).collect();
+            // `hops` is built in the same loop as `memories`; a length
+            // mismatch would silently drop `hops` from some records.
+            debug_assert!(hops.is_none_or(|h| h.len() == memories.len()));
+            let records: Vec<Value> = memories
+                .iter()
+                .enumerate()
+                .map(|(i, (m, s))| memory_json(m, *s, hops.and_then(|h| h.get(i).copied())))
+                .collect();
             ToolResult::text(Value::Array(records).to_string())
         }
     }
@@ -1446,7 +1513,7 @@ fn tool_recall(
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
                 let _ = store.batch_update_access(&ids);
 
-                return render_memories(&expanded, compact, format);
+                return render_memories(&expanded, None, compact, format);
             }
         }
     }
@@ -1501,7 +1568,97 @@ fn tool_recall(
     // FTS-path results have synthetic scores — reset to -1.0 for display
     // so we don't claim a hybrid-search confidence we didn't compute.
     let for_display: Vec<(Memory, f32)> = expanded.into_iter().map(|(m, _)| (m, -1.0)).collect();
-    render_memories(&for_display, compact, format)
+    render_memories(&for_display, None, compact, format)
+}
+
+/// Follow `related_ids` breadth-first from one memory (issue #476). Each
+/// memory is visited once, so link cycles terminate. Out-of-project
+/// neighbors are dropped and not traversed (same scope rule as recall's
+/// R13b re-filter); links to deleted memories are skipped.
+fn tool_related(store: &Store, args: &Value, compact: bool) -> ToolResult {
+    let id = match args.get("id") {
+        Some(Value::String(id)) => id.as_str(),
+        None | Some(Value::Null) => return ToolResult::error("missing required field: id".into()),
+        Some(other) => return ToolResult::error(format!("id must be a string, got {other}")),
+    };
+    let format = match parse_recall_format(args) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    // Clamp to the schema's advertised bounds.
+    let depth = match get_i64_strict(args, "depth", 1) {
+        Ok(d) => d.clamp(1, 3) as usize,
+        Err(e) => return e,
+    };
+    let limit = match get_i64_strict(args, "limit", 20) {
+        Ok(l) => l.clamp(1, 50) as usize,
+        Err(e) => return e,
+    };
+    let project = recall_project(args);
+
+    let start = match store.get(id) {
+        Ok(Some(m)) => m,
+        Ok(None) => return ToolResult::error(format!("memory not found: {id}")),
+        Err(e) => return ToolResult::error(format!("failed to get memory {id}: {e}")),
+    };
+    // Without this check the walk would serve the neighbors of an
+    // out-of-scope memory, and a scope mismatch would look like "no links".
+    if !in_project_scope(&start, project.as_deref()) {
+        return ToolResult::error(format!(
+            "memory {id} (topic '{}') is outside project '{}'; pass the memory's project, or project=\"\" to search all projects",
+            start.topic,
+            project.as_deref().unwrap_or_default()
+        ));
+    }
+
+    let mut seen: HashSet<String> = HashSet::from([start.id.clone()]);
+    let mut frontier = vec![start];
+    let mut found: Vec<(Memory, f32)> = Vec::new();
+    let mut hops: Vec<usize> = Vec::new();
+    'walk: for hop in 1..=depth {
+        let next_ids: Vec<String> = frontier
+            .iter()
+            .flat_map(|m| m.related_ids.iter())
+            .filter(|rid| seen.insert((*rid).clone()))
+            .cloned()
+            .collect();
+        // `related_ids` has no length cap (an import can carry thousands),
+        // so fetch only as many ids per batch as results are still needed.
+        let mut next_frontier: Vec<Memory> = Vec::new();
+        let mut pending = next_ids.as_slice();
+        while !pending.is_empty() {
+            let room = limit - found.len();
+            let (batch, rest) = pending.split_at(room.min(pending.len()));
+            pending = rest;
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            let mut fetched = match store.get_many(&refs) {
+                Ok(f) => f,
+                Err(e) => return ToolResult::error(format!("failed to get linked memories: {e}")),
+            };
+            for m in batch.iter().filter_map(|rid| fetched.remove(rid)) {
+                if !in_project_scope(&m, project.as_deref()) {
+                    continue;
+                }
+                found.push((m.clone(), -1.0));
+                hops.push(hop);
+                next_frontier.push(m);
+                if found.len() >= limit {
+                    break 'walk;
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+
+    let ids: Vec<&str> = found.iter().map(|(m, _)| m.id.as_str()).collect();
+    if let Err(e) = store.batch_update_access(&ids) {
+        tracing::warn!(error = %e, "access-count update failed");
+    }
+
+    render_memories(&found, Some(&hops), compact, format)
 }
 
 fn tool_forget(store: &Store, args: &Value) -> ToolResult {
@@ -4493,7 +4650,7 @@ description = "A test project"
     fn test_json_recall_prints_f32_fields_without_float_noise() {
         let mut m = issue476_memory("proj", "Rust memory engine");
         m.weight = 0.95;
-        let text = memory_json(&m, 0.85).to_string();
+        let text = memory_json(&m, 0.85, None).to_string();
         assert!(text.contains("\"weight\":0.95,"), "{text}");
         assert!(text.contains("\"score\":0.85"), "{text}");
     }
@@ -4602,5 +4759,233 @@ description = "A test project"
         let (_, text) =
             issue476_recall(&store, json!({"query": "Rust memory", "project": ""}), true);
         assert_eq!(text, "[proj] Rust memory engine\n");
+    }
+
+    /// Store `a -> b -> c -> d`, with a back link `b -> a` to make a cycle.
+    fn issue476_chain() -> (Store, Vec<String>) {
+        let mut ms: Vec<Memory> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| issue476_memory("proj", &format!("memory {s}")))
+            .collect();
+        let ids: Vec<String> = ms.iter().map(|m| m.id.clone()).collect();
+        ms[0].related_ids = vec![ids[1].clone()];
+        ms[1].related_ids = vec![ids[0].clone(), ids[2].clone()];
+        ms[2].related_ids = vec![ids[3].clone()];
+        let store = Store::in_memory().unwrap();
+        for m in ms {
+            store.store(m).unwrap();
+        }
+        (store, ids)
+    }
+
+    fn issue476_related(store: &Store, args: Value) -> (bool, String) {
+        let result = call_tool(store, None, "icm_memory_related", &args, false);
+        (result.is_error, result.content[0].text.clone())
+    }
+
+    fn issue476_ids_and_hops(text: &str) -> Vec<(String, u64)> {
+        let rows: Vec<Value> = serde_json::from_str(text).unwrap();
+        rows.iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["hops"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_related_missing_id_is_an_error() {
+        let (store, _) = issue476_chain();
+        let (is_error, text) = issue476_related(&store, json!({}));
+        assert!(is_error);
+        assert!(text.contains("id"), "{text}");
+    }
+
+    #[test]
+    fn test_related_unknown_id_is_an_error() {
+        let (store, _) = issue476_chain();
+        let (is_error, text) = issue476_related(&store, json!({"id": "01NOPE", "project": ""}));
+        assert!(is_error);
+        assert!(text.contains("01NOPE"), "{text}");
+    }
+
+    #[test]
+    fn test_related_default_depth_returns_direct_links_only() {
+        let (store, ids) = issue476_chain();
+        let (is_error, text) = issue476_related(
+            &store,
+            json!({"id": ids[1], "project": "", "format": "json"}),
+        );
+        assert!(!is_error, "{text}");
+        let got = issue476_ids_and_hops(&text);
+        assert_eq!(got, vec![(ids[0].clone(), 1), (ids[2].clone(), 1)]);
+    }
+
+    #[test]
+    fn test_related_depth_follows_links_without_revisiting_the_start() {
+        let (store, ids) = issue476_chain();
+        let (_, text) = issue476_related(
+            &store,
+            json!({"id": ids[0], "depth": 3, "project": "", "format": "json"}),
+        );
+        let got = issue476_ids_and_hops(&text);
+        assert_eq!(
+            got,
+            vec![
+                (ids[1].clone(), 1),
+                (ids[2].clone(), 2),
+                (ids[3].clone(), 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_related_depth_is_clamped_to_three() {
+        let (store, ids) = issue476_chain();
+        let mut ms: Vec<Memory> = (0..2)
+            .map(|i| issue476_memory("proj", &format!("tail {i}")))
+            .collect();
+        ms[0].related_ids = vec![ms[1].id.clone()];
+        let tail_far = ms[1].id.clone();
+        let mut d = store.get(&ids[3]).unwrap().unwrap();
+        d.related_ids = vec![ms[0].id.clone()];
+        store.update(&d).unwrap();
+        for m in ms {
+            store.store(m).unwrap();
+        }
+        let (_, text) = issue476_related(
+            &store,
+            json!({"id": ids[0], "depth": 99, "project": "", "format": "json"}),
+        );
+        let got = issue476_ids_and_hops(&text);
+        assert_eq!(got.last().unwrap().1, 3);
+        assert!(got.iter().all(|(id, _)| *id != tail_far));
+    }
+
+    #[test]
+    fn test_related_limit_caps_the_result_count() {
+        let (store, ids) = issue476_chain();
+        let (_, text) = issue476_related(
+            &store,
+            json!({"id": ids[0], "depth": 3, "limit": 2, "project": "", "format": "json"}),
+        );
+        assert_eq!(issue476_ids_and_hops(&text).len(), 2);
+    }
+
+    #[test]
+    fn test_related_dangling_links_are_skipped() {
+        let (store, ids) = issue476_chain();
+        store.delete(&ids[2]).unwrap();
+        let (is_error, text) = issue476_related(
+            &store,
+            json!({"id": ids[1], "project": "", "format": "json"}),
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(issue476_ids_and_hops(&text), vec![(ids[0].clone(), 1)]);
+    }
+
+    #[test]
+    fn test_related_project_filter_drops_and_does_not_traverse_other_projects() {
+        let mut a = issue476_memory("context-alpha", "alpha start");
+        let mut b = issue476_memory("context-beta", "beta bridge");
+        let c = issue476_memory("context-alpha", "alpha behind beta");
+        a.related_ids = vec![b.id.clone()];
+        b.related_ids = vec![c.id.clone()];
+        let a_id = a.id.clone();
+        let store = Store::in_memory().unwrap();
+        for m in [a, b, c] {
+            store.store(m).unwrap();
+        }
+        let (is_error, text) = issue476_related(
+            &store,
+            json!({"id": a_id, "depth": 2, "project": "alpha", "format": "json"}),
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn test_related_rejects_start_memory_outside_project() {
+        let mut a = issue476_memory("context-beta", "beta start");
+        let b = issue476_memory("context-beta", "beta neighbor");
+        a.related_ids = vec![b.id.clone()];
+        let a_id = a.id.clone();
+        let store = Store::in_memory().unwrap();
+        for m in [a, b] {
+            store.store(m).unwrap();
+        }
+        let (is_error, text) = issue476_related(&store, json!({"id": a_id, "project": "alpha"}));
+        assert!(is_error, "{text}");
+        assert!(text.contains("outside project 'alpha'"), "{text}");
+
+        let (is_error, text) = issue476_related(
+            &store,
+            json!({"id": a_id, "project": "beta", "format": "json"}),
+        );
+        assert!(!is_error, "{text}");
+        assert_eq!(issue476_ids_and_hops(&text).len(), 1);
+    }
+
+    #[test]
+    fn test_related_skips_dangling_links_when_filling_the_limit() {
+        let mut start = issue476_memory("proj", "many links");
+        let real: Vec<Memory> = (0..3)
+            .map(|i| issue476_memory("proj", &format!("real {i}")))
+            .collect();
+        start.related_ids = (0..5).map(|i| format!("01GONE{i}")).collect();
+        start.related_ids.extend(real.iter().map(|m| m.id.clone()));
+        let (start_id, want) = (
+            start.id.clone(),
+            vec![real[0].id.clone(), real[1].id.clone()],
+        );
+        let store = Store::in_memory().unwrap();
+        for m in std::iter::once(start).chain(real) {
+            store.store(m).unwrap();
+        }
+        let (_, text) = issue476_related(
+            &store,
+            json!({"id": start_id, "limit": 2, "project": "", "format": "json"}),
+        );
+        let got: Vec<String> = issue476_ids_and_hops(&text)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_related_rejects_wrongly_typed_args() {
+        let (store, ids) = issue476_chain();
+        for (args, field) in [
+            (json!({"id": 123}), "id"),
+            (json!({"id": ids[0], "depth": "3"}), "depth"),
+            (json!({"id": ids[0], "limit": 2.5}), "limit"),
+            (json!({"id": ids[0], "format": ["json"]}), "format"),
+        ] {
+            let (is_error, text) = issue476_related(&store, args.clone());
+            assert!(is_error, "{args} was accepted: {text}");
+            assert!(text.starts_with(field), "{args}: {text}");
+        }
+    }
+
+    #[test]
+    fn test_related_no_links_gives_the_no_memories_text() {
+        let store = Store::in_memory().unwrap();
+        let m = issue476_memory("proj", "lonely");
+        let id = m.id.clone();
+        store.store(m).unwrap();
+        let (is_error, text) = issue476_related(&store, json!({"id": id, "project": ""}));
+        assert!(!is_error, "{text}");
+        assert!(text.contains("No memories"), "{text}");
+    }
+
+    #[test]
+    fn test_related_text_output_names_each_linked_id() {
+        let (store, ids) = issue476_chain();
+        let (_, text) = issue476_related(&store, json!({"id": ids[1], "project": ""}));
+        assert!(text.contains(&format!("--- {} ---", ids[0])), "{text}");
+        assert!(text.contains(&format!("--- {} ---", ids[2])), "{text}");
     }
 }
