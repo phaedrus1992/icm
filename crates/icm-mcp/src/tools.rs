@@ -1312,6 +1312,11 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
                     mem.keywords.iter().map(|k| flatten(k)).collect();
                 output.push_str(&format!("  keywords: {}\n", flattened_keywords.join(", ")));
             }
+            if !mem.related_ids.is_empty() {
+                let flattened_links: Vec<String> =
+                    mem.related_ids.iter().map(|l| flatten(l)).collect();
+                output.push_str(&format!("  links: {}\n", flattened_links.join(", ")));
+            }
             if let Some(ref raw) = mem.raw_excerpt {
                 let shown = cap_raw_excerpt(raw);
                 if shown.len() < raw.len() {
@@ -4574,5 +4579,28 @@ description = "A test project"
             assert!(is_error, "format {bad} was accepted");
             assert!(text.contains("format"), "{text}");
         }
+    }
+
+    #[test]
+    fn test_text_recall_lists_links() {
+        let mut a = issue476_memory("proj", "Rust memory engine");
+        a.related_ids = vec!["01LINKEDID".into()];
+        let store = issue476_store_with(vec![a]);
+        let (_, text) = issue476_recall(
+            &store,
+            json!({"query": "Rust memory", "project": ""}),
+            false,
+        );
+        assert!(text.contains("  links: 01LINKEDID\n"), "{text}");
+    }
+
+    #[test]
+    fn test_compact_text_recall_is_unchanged() {
+        let mut a = issue476_memory("proj", "Rust memory engine");
+        a.related_ids = vec!["01LINKEDID".into()];
+        let store = issue476_store_with(vec![a]);
+        let (_, text) =
+            issue476_recall(&store, json!({"query": "Rust memory", "project": ""}), true);
+        assert_eq!(text, "[proj] Rust memory engine\n");
     }
 }
