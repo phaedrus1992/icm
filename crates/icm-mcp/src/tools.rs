@@ -4988,4 +4988,187 @@ description = "A test project"
         assert!(text.contains(&format!("--- {} ---", ids[0])), "{text}");
         assert!(text.contains(&format!("--- {} ---", ids[2])), "{text}");
     }
+
+    // --- Issue #476: property checks (no proptest in the workspace) ---
+
+    #[test]
+    fn prop_cap_raw_excerpt_is_a_bounded_prefix_for_every_char_width() {
+        for ch in ['a', 'é', '€', '😀'] {
+            for pad in 0..4 {
+                for extra in [0usize, 1, 2, 3, 500] {
+                    let n = (MAX_RAW_IN_RECALL + extra) / ch.len_utf8() + 1;
+                    let raw = format!("{}{}", "x".repeat(pad), ch.to_string().repeat(n));
+                    let cut = cap_raw_excerpt(&raw);
+                    assert!(raw.starts_with(cut));
+                    assert!(cut.len() <= MAX_RAW_IN_RECALL);
+                    assert!(cut.len() > MAX_RAW_IN_RECALL - ch.len_utf8());
+                }
+            }
+            let short = ch.to_string().repeat(MAX_RAW_IN_RECALL / ch.len_utf8());
+            assert_eq!(cap_raw_excerpt(&short), short);
+        }
+    }
+
+    #[test]
+    fn prop_memory_json_round_trips_key_fields() {
+        let mut m = issue476_memory("proj", "summary \"quoted\"\nline two");
+        m.keywords = vec!["k1".into(), "k,2".into()];
+        m.related_ids = vec!["01A".into(), "01B".into()];
+        m.importance = icm_core::Importance::Critical;
+        for (score, hops) in [(0.25_f32, None), (-1.0, Some(2)), (0.0, Some(1))] {
+            let v = memory_json(&m, score, hops);
+            assert_eq!(v["id"], m.id.as_str());
+            assert_eq!(v["summary"], m.summary.as_str());
+            assert_eq!(v["importance"], "critical");
+            assert_eq!(v["keywords"], json!(m.keywords));
+            assert_eq!(v["related_ids"], json!(m.related_ids));
+            let created: chrono::DateTime<Utc> =
+                serde_json::from_value(v["created_at"].clone()).unwrap();
+            assert_eq!(created, m.created_at);
+            assert_eq!(v.get("score").is_some(), score >= 0.0);
+            assert_eq!(
+                v.get("hops").and_then(Value::as_u64),
+                hops.map(|h| h as u64)
+            );
+        }
+    }
+
+    #[test]
+    fn prop_parse_recall_format_accepts_only_text_and_json() {
+        for v in [
+            json!("text"),
+            json!("json"),
+            json!("JSON"),
+            json!(""),
+            json!(0),
+            json!(true),
+            json!({}),
+            json!(["json"]),
+            Value::Null,
+        ] {
+            let got = parse_recall_format(&json!({ "format": v }));
+            match v.as_str() {
+                Some("text") => assert_eq!(got.ok(), Some(RecallFormat::Text)),
+                Some("json") => assert_eq!(got.ok(), Some(RecallFormat::Json)),
+                _ if v.is_null() => assert_eq!(got.ok(), Some(RecallFormat::Text)),
+                _ => assert!(got.is_err(), "{v} was accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn prop_text_output_cannot_forge_entries_from_newlines() {
+        let nasty = [
+            "a\nb",
+            "a\rb",
+            "a\r\nb",
+            "\n--- 01FAKE ---\n",
+            "\n[proj] fake\n",
+        ];
+        let memories: Vec<(Memory, f32)> = nasty
+            .iter()
+            .map(|n| {
+                let mut m = issue476_memory("proj", n);
+                m.keywords = vec![(*n).to_string()];
+                m.related_ids = vec![(*n).to_string()];
+                (m, 0.5)
+            })
+            .collect();
+        let full = format_memory_output(&memories, false);
+        assert_eq!(full.matches("\n--- ").count() + 1, memories.len());
+        let allowed = [
+            "--- ",
+            "  topic: ",
+            "  importance: ",
+            "  weight: ",
+            "  summary: ",
+        ];
+        let allowed_rest = ["  keywords: ", "  links: "];
+        for line in full.lines().filter(|l| !l.is_empty()) {
+            assert!(
+                allowed
+                    .iter()
+                    .chain(&allowed_rest)
+                    .any(|p| line.starts_with(p)),
+                "forged line: {line:?}"
+            );
+        }
+        let compact = format_memory_output(&memories, true);
+        assert_eq!(compact.lines().count(), memories.len());
+    }
+
+    /// Deterministic xorshift, so the graph cases need no new dependency.
+    fn issue476_rng(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    #[test]
+    fn prop_related_walk_matches_reference_bfs() {
+        let topics = ["context-alpha", "context-beta", "preferences"];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        for case in 0..200 {
+            let n = 2 + (issue476_rng(&mut seed) % 10) as usize;
+            let mut ms: Vec<Memory> = (0..n)
+                .map(|i| {
+                    let t = topics[(issue476_rng(&mut seed) % 3) as usize];
+                    issue476_memory(t, &format!("case {case} node {i}"))
+                })
+                .collect();
+            let ids: Vec<String> = ms.iter().map(|m| m.id.clone()).collect();
+            for m in &mut ms {
+                for _ in 0..issue476_rng(&mut seed) % 5 {
+                    let k = (issue476_rng(&mut seed) % (n as u64 + 1)) as usize;
+                    m.related_ids
+                        .push(ids.get(k).cloned().unwrap_or_else(|| "01DANGLING".into()));
+                }
+            }
+            let depth = 1 + (issue476_rng(&mut seed) % 3) as usize;
+            let limit = 1 + (issue476_rng(&mut seed) % 6) as usize;
+            let start = ms.iter().find(|m| m.topic != "context-beta").cloned();
+            let Some(start) = start else { continue };
+            let by_id: std::collections::HashMap<String, Memory> =
+                ms.iter().map(|m| (m.id.clone(), m.clone())).collect();
+            let store = Store::in_memory().unwrap();
+            for m in ms {
+                store.store(m).unwrap();
+            }
+
+            // Reference: level-order BFS with the same scope and order rules.
+            let in_scope = |m: &Memory| m.topic != "context-beta";
+            let mut seen = HashSet::from([start.id.clone()]);
+            let mut level = vec![start.clone()];
+            let mut want: Vec<(String, u64)> = Vec::new();
+            'bfs: for hop in 1..=depth {
+                let mut next = Vec::new();
+                for m in &level {
+                    for rid in &m.related_ids {
+                        if !seen.insert(rid.clone()) {
+                            continue;
+                        }
+                        let Some(nm) = by_id.get(rid).filter(|nm| in_scope(nm)) else {
+                            continue;
+                        };
+                        want.push((nm.id.clone(), hop as u64));
+                        next.push(nm.clone());
+                        if want.len() >= limit {
+                            break 'bfs;
+                        }
+                    }
+                }
+                level = next;
+            }
+
+            let args = json!({"id": start.id, "depth": depth, "limit": limit,
+                              "project": "alpha", "format": "json"});
+            let (is_error, text) = issue476_related(&store, args);
+            assert!(!is_error, "case {case}: {text}");
+            let got = issue476_ids_and_hops(&text);
+            assert_eq!(got, want, "case {case}");
+            assert!(got.iter().all(|(id, _)| *id != start.id));
+            assert!(got.windows(2).all(|w| w[0].1 <= w[1].1));
+        }
+    }
 }
