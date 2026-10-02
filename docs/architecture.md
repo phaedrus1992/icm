@@ -295,7 +295,7 @@ On store via MCP, if an existing memory in the same topic has >85% hybrid search
 
 ## icm-mcp
 
-MCP server implementing JSON-RPC 2.0 over stdio. 18 tools.
+MCP server implementing JSON-RPC 2.0 over stdio. 32 tools.
 
 ### Protocol Flow
 
@@ -319,7 +319,8 @@ Client                              ICM Server
 | Tool | Required args | Optional args |
 |------|--------------|---------------|
 | `icm_memory_store` | `topic`, `content` | `importance`, `keywords[]`, `raw_excerpt` |
-| `icm_memory_recall` | `query` | `topic`, `keyword`, `limit` |
+| `icm_memory_recall` | `query` | `topic`, `keyword`, `limit`, `project`, `format` (`text`/`json`) |
+| `icm_memory_related` | `id` | `depth` (1-3), `limit`, `project`, `format` (`text`/`json`) |
 | `icm_memory_update` | `id`, `content` | `importance`, `keywords[]` |
 | `icm_memory_forget` | `id` | — |
 | `icm_memory_consolidate` | `topic`, `summary` | — |

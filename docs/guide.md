@@ -51,7 +51,7 @@ This auto-detects your AI tools and configures the MCP server. Supports 14 tools
 
 ### 3. Use
 
-That's it. Your agent now has access to 18 MCP tools. It uses them automatically based on the server instructions.
+That's it. Your agent now has access to 32 MCP tools. It uses them automatically based on the server instructions.
 
 ## Two Memory Models
 
@@ -263,7 +263,8 @@ icm embed --topic "decisions" # Only one topic
 | Tool | What it does |
 |------|-------------|
 | `icm_memory_store` | Store a memory. Auto-dedup: >85% similar in same topic → update. Warns at >7 entries. |
-| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `limit`. Auto-decay if >24h. |
+| `icm_memory_recall` | Search by query. Filters: `topic`, `keyword`, `limit`. `format: "json"` returns records with `id` and `related_ids`. Auto-decay if >24h. |
+| `icm_memory_related` | Fetch the memories linked to a memory ID, up to 3 hops (`depth`). |
 | `icm_memory_update` | Edit content, importance, or keywords of an existing memory by ID. |
 | `icm_memory_forget` | Delete a memory by ID. |
 | `icm_memory_consolidate` | Replace all memories of a topic with a single summary. |
