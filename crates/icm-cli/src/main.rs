@@ -4846,7 +4846,7 @@ fn cmd_code_areas(
             println!("{}", "-".repeat(80));
             for r in &rows {
                 let proj = if r.project.len() > 20 {
-                    format!("{}…", &r.project[..19])
+                    format!("{}…", truncate_at_char_boundary(&r.project, 19))
                 } else {
                     r.project.clone()
                 };
