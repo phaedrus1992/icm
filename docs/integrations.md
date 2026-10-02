@@ -280,12 +280,13 @@ Or with compact mode (shorter responses, fewer tokens):
 
 ## MCP Tools Available
 
-When connected via MCP, these 18 tools are available:
+When connected via MCP, these 32 tools are available:
 
 | Tool | Description |
 |------|-------------|
 | `icm_memory_store` | Store a memory |
 | `icm_memory_recall` | Search memories (hybrid: FTS + vector) |
+| `icm_memory_related` | Fetch memories linked to a memory |
 | `icm_memory_update` | Update an existing memory |
 | `icm_memory_forget` | Delete a memory |
 | `icm_memory_consolidate` | Merge topic memories into one |

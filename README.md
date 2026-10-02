@@ -368,14 +368,15 @@ Rust + SQLite + FTS5 — 0 Python, 0 ChromaDB, 0 external service. Writes are ~1
 ChromaDB-based verbatim stores; the whole transcript lives in the same SQLite file as your
 memories and memoirs.
 
-## MCP Tools (31)
+## MCP Tools (32)
 
 ### Memory tools
 
 | Tool | Description |
 |------|-------------|
 | `icm_memory_store` | Store with auto-dedup (>85% similarity → update instead of duplicate) |
-| `icm_memory_recall` | Search by query, filter by topic / keyword / project |
+| `icm_memory_recall` | Search by query, filter by topic / keyword / project. `format: "json"` returns records with `id` and `related_ids` |
+| `icm_memory_related` | Fetch the memories linked to an id, up to 3 hops |
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
 | `icm_memory_forget_topic` | Delete all memories in a given topic |
