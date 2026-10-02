@@ -1180,6 +1180,23 @@ fn tool_store(
     }
 }
 
+/// raw_excerpt can hold up to 64 KB per memory; dumping it in full for every
+/// hit floods the client LLM's context (audit finding). Cap the recall view —
+/// the full excerpt stays in the store.
+const MAX_RAW_IN_RECALL: usize = 2048;
+
+/// Prefix of `raw` that a recall view shows, cut on a char boundary.
+fn cap_raw_excerpt(raw: &str) -> &str {
+    if raw.len() <= MAX_RAW_IN_RECALL {
+        return raw;
+    }
+    let mut cut = MAX_RAW_IN_RECALL;
+    while !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &raw[..cut]
+}
+
 fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
     // Audit finding: `summary` has no newline/CR validation at the store
     // layer (only `topic` is checked — see `validate_fields`), and it can
@@ -1214,19 +1231,10 @@ fn format_memory_output(memories: &[(Memory, f32)], compact: bool) -> String {
                 output.push_str(&format!("  keywords: {}\n", flattened_keywords.join(", ")));
             }
             if let Some(ref raw) = mem.raw_excerpt {
-                // raw_excerpt can hold up to 64 KB per memory; dumping it in
-                // full for every hit floods the client LLM's context (audit
-                // finding). Cap the recall view — the full excerpt stays in
-                // the store.
-                const MAX_RAW_IN_RECALL: usize = 2048;
-                if raw.len() > MAX_RAW_IN_RECALL {
-                    let mut cut = MAX_RAW_IN_RECALL;
-                    while !raw.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
+                let shown = cap_raw_excerpt(raw);
+                if shown.len() < raw.len() {
                     output.push_str(&format!(
-                        "  raw: {}… [truncated, {} bytes total]\n",
-                        &raw[..cut],
+                        "  raw: {shown}… [truncated, {} bytes total]\n",
                         raw.len()
                     ));
                 } else {
