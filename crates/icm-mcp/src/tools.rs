@@ -1407,9 +1407,15 @@ fn recall_project(args: &Value) -> Option<String> {
     match get_str(args, "project") {
         Some("") => None,
         Some(p) => Some(p.to_string()),
-        None => std::env::current_dir()
-            .ok()
-            .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy())),
+        None => {
+            let cwd_project = std::env::current_dir()
+                .ok()
+                .and_then(|p| icm_core::project::project_from_path(&p.to_string_lossy()));
+            if cwd_project.is_none() {
+                tracing::warn!("no project found for the server cwd; searching all projects");
+            }
+            cwd_project
+        }
     }
 }
 
@@ -1475,8 +1481,17 @@ fn tool_recall(
 
     // Try hybrid search if embedder is available
     if let Some(emb) = embedder {
-        if let Ok(query_emb) = emb.embed_query(query) {
-            if let Ok(results) = store.search_hybrid(query, &query_emb, query_limit) {
+        // Both failures fall back to keyword search below, which has no
+        // scores; log them so a missing `score` field has a visible cause.
+        if let Ok(query_emb) = emb.embed_query(query).inspect_err(
+            |e| tracing::warn!(error = %e, "query embedding failed; recall uses keyword search"),
+        ) {
+            if let Ok(results) = store
+                .search_hybrid(query, &query_emb, query_limit)
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "hybrid search failed; recall uses keyword search")
+                })
+            {
                 let mut scored_results = results;
                 scored_results.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
@@ -1499,6 +1514,7 @@ fn tool_recall(
                 let max_neighbors = (query_limit / 3).max(1);
                 let mut expanded = store
                     .expand_with_neighbors(&scored_results, max_neighbors, 0.5, query_limit)
+                    .inspect_err(|e| tracing::warn!(error = %e, "neighbor expansion failed"))
                     .unwrap_or(scored_results);
                 expanded.retain(|(m, _)| project_filter(m));
                 if let Some(t) = topic {
@@ -1511,7 +1527,9 @@ fn tool_recall(
 
                 // Batch update access counts (includes expanded neighbors)
                 let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-                let _ = store.batch_update_access(&ids);
+                if let Err(e) = store.batch_update_access(&ids) {
+                    tracing::warn!(error = %e, "access-count update failed during recall");
+                }
 
                 return render_memories(&expanded, None, compact, format);
             }
@@ -1552,6 +1570,7 @@ fn tool_recall(
     let max_neighbors = (limit / 3).max(1);
     let mut expanded = store
         .expand_with_neighbors(&scored, max_neighbors, 0.5, limit)
+        .inspect_err(|e| tracing::warn!(error = %e, "neighbor expansion failed"))
         .unwrap_or(scored);
     expanded.retain(|(m, _)| project_filter(m));
     if let Some(t) = topic {
@@ -1563,7 +1582,9 @@ fn tool_recall(
 
     // Batch update access counts (includes expanded neighbors)
     let ids: Vec<&str> = expanded.iter().map(|(m, _)| m.id.as_str()).collect();
-    let _ = store.batch_update_access(&ids);
+    if let Err(e) = store.batch_update_access(&ids) {
+        tracing::warn!(error = %e, "access-count update failed");
+    }
 
     // FTS-path results have synthetic scores — reset to -1.0 for display
     // so we don't claim a hybrid-search confidence we didn't compute.
