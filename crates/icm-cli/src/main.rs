@@ -4069,7 +4069,7 @@ fn cmd_transcript_list_sessions(store: &Store, project: Option<&str>, limit: usi
     println!("{}", "-".repeat(102));
     for s in sessions {
         let proj = s.project.as_deref().unwrap_or("-");
-        let short_id = if s.id.len() > 26 { &s.id[..26] } else { &s.id };
+        let short_id = truncate_at_char_boundary(&s.id, 26);
         println!(
             "{:<28} {:<14} {:<18} {:<20} {:<20}",
             short_id,
@@ -4157,7 +4157,7 @@ fn cmd_transcript_stats(store: &Store) -> Result<()> {
     if !s.top_sessions.is_empty() {
         println!("\nTop sessions:");
         for (sid, count) in &s.top_sessions {
-            let short = if sid.len() > 26 { &sid[..26] } else { sid };
+            let short = truncate_at_char_boundary(sid, 26);
             println!("  {short}  {count} msg");
         }
     }
@@ -5779,8 +5779,10 @@ fn cmd_code_areas(
             );
             println!("{}", "-".repeat(80));
             for r in &rows {
-                let proj = if r.project.len() > 20 {
-                    format!("{}…", &r.project[..19])
+                // Count chars, not bytes: `{:<20}` pads by chars, so a byte
+                // count cuts a short accented name that fits the column.
+                let proj = if r.project.chars().count() > 20 {
+                    format!("{}…", r.project.chars().take(19).collect::<String>())
                 } else {
                     r.project.clone()
                 };
@@ -13332,7 +13334,7 @@ fn cmd_memoir_distill(store: &Store, from_topic: &str, into_name: &str) -> Resul
         let concept_name = if !mem.keywords.is_empty() {
             mem.keywords[0].clone()
         } else {
-            format!("{}-{}", from_topic, &mem.id[..8])
+            format!("{}-{}", from_topic, truncate_at_char_boundary(&mem.id, 8))
         };
 
         if store
