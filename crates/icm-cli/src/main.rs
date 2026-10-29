@@ -13403,6 +13403,67 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// The display views cut strings for their columns. A multi-byte char at
+/// the cut, or a string shorter than the cut, panicked with a byte slice.
+#[cfg(test)]
+mod display_cut_tests {
+    use super::*;
+    use icm_core::{Role, TranscriptStore};
+
+    /// `é` takes bytes 25..27, so a byte cut at 26 lands inside it.
+    const ID_WIDE_AT_26: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaéb";
+
+    #[test]
+    fn transcript_views_accept_a_multibyte_session_id() {
+        let store = Store::in_memory().unwrap();
+        store
+            .ensure_session(ID_WIDE_AT_26, "demo", None, None)
+            .unwrap();
+        store
+            .record_message(ID_WIDE_AT_26, Role::User, "hi", None, None, None)
+            .unwrap();
+        cmd_transcript_list_sessions(&store, None, 10).unwrap();
+        cmd_transcript_stats(&store).unwrap();
+    }
+
+    #[test]
+    fn code_areas_table_accepts_a_multibyte_project_name() {
+        let store = Store::in_memory().unwrap();
+        // `é` takes bytes 18..20, so a byte cut at 19 lands inside it.
+        let project = "aaaaaaaaaaaaaaaaaaébb";
+        store
+            .upsert_code_area(project, "/x/y.rs", None, None, None)
+            .unwrap();
+        cmd_code_areas(
+            &store,
+            None,
+            Some(project),
+            None,
+            10,
+            CodeAreasFormat::Table,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn memoir_distill_accepts_a_short_multibyte_memory_id() {
+        let store = Store::in_memory().unwrap();
+        // Import keeps the id of the export file, so it can be any string.
+        let mut memory = Memory::new("t".into(), "no keywords".into(), Importance::Medium);
+        memory.id = "é".into();
+        store.store(memory).unwrap();
+        cmd_memoir_create(&store, "demo".into(), String::new()).unwrap();
+        cmd_memoir_distill(&store, "t", "demo").unwrap();
+        let memoir = store.get_memoir_by_name("demo").unwrap().unwrap();
+        assert!(
+            store
+                .get_concept_by_name(&memoir.id, "t-é")
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
 #[cfg(test)]
 mod truncate_tests {
     use super::{truncate_at_char_boundary, truncate_tail_at_char_boundary};
